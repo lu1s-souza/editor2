@@ -1,11 +1,14 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"os"
 	"regexp"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/lu1s-souza/editor2/internal/buffer"
+	"github.com/lu1s-souza/editor2/internal/editor"
 )
 
 type Editor struct {
@@ -15,8 +18,13 @@ type Editor struct {
 	offsetX, offsetY int
 	width, height    int
 
-	running bool
-	lines   int
+	running   bool
+	lines     int
+	filename  string
+	dirty     bool
+	status    string
+	undoStack []editor.Action
+	redoStack []editor.Action
 }
 
 func main() {
@@ -25,11 +33,89 @@ func main() {
 		running: true,
 	}
 
+	if len(os.Args) >= 2 {
+		editor.OpenFile(os.Args[1])
+	} else {
+		editor.status = "New file"
+	}
 	if err := editor.Init(); err != nil {
 		log.Fatalf("Failed to initialize editr: %v", err)
 	}
 
 	editor.Run()
+}
+
+func (e *Editor) Do(action editor.Action) {
+	action.Do(e.buffer)
+	e.undoStack = append(e.undoStack, action)
+	e.redoStack = nil
+	e.dirty = true
+}
+
+func (e *Editor) Undo() {
+	if len(e.undoStack) == 0 {
+		return
+	}
+	lastAction := e.undoStack[len(e.undoStack)-1]
+	e.undoStack = e.undoStack[:len(e.undoStack)-1]
+
+	lastAction.Undo(e.buffer)
+
+	e.redoStack = append(e.redoStack, lastAction)
+	e.dirty = true
+}
+
+func (e *Editor) Redo() {
+	if len(e.redoStack) == 0 {
+		return
+	}
+
+	lastAction := e.redoStack[len(e.redoStack)-1]
+	e.redoStack = e.redoStack[:len(e.redoStack)-1]
+
+	lastAction.Do(e.buffer)
+
+	e.undoStack = append(e.undoStack, lastAction)
+	e.dirty = true
+}
+
+func (e *Editor) OpenFile(filename string) {
+
+	e.filename = filename
+	content, err := os.ReadFile(filename)
+
+	if err != nil {
+		if os.IsNotExist(err) {
+			e.status = fmt.Sprintf("New file: %s", filename)
+			return
+		}
+		log.Fatalf("Failed to open file: %v", err)
+	}
+
+	for _, r := range string(content) {
+		e.buffer.Insert(r)
+	}
+	e.buffer.MoveCursor(-e.buffer.Cursor())
+	e.dirty = false
+	e.status = fmt.Sprintf("Opened %s", filename)
+}
+
+func (e *Editor) SaveFile() {
+	if e.filename == "" {
+		e.drawSavePopup()
+		e.status = "Cannot save: No filename specified."
+		return
+	}
+
+	content := e.buffer.String()
+	err := os.WriteFile(e.filename, []byte(content), 0644)
+	if err != nil {
+		e.status = fmt.Sprintf("Error saving file: %v", err)
+		return
+	}
+
+	e.dirty = false
+	e.status = fmt.Sprintf("Saved %s (%d bytes)", e.filename, len(content))
 }
 
 func (e *Editor) Init() error {
@@ -56,22 +142,50 @@ func (e *Editor) Run() {
 	defer e.screen.Fini()
 
 	for e.running {
-		e.Draw()
 
 		event := e.screen.PollEvent()
 
 		e.handleEvent(event)
+		e.Draw()
 	}
 }
 
 func (e *Editor) handleEvent(event tcell.Event) {
 	switch ev := event.(type) {
 	case *tcell.EventKey:
+		e.status = ""
+
+		if ev.Key() == tcell.KeyCtrlZ {
+			e.Undo()
+			return
+		}
+
+		if ev.Key() == tcell.KeyCtrlY {
+			e.Redo()
+			return
+		}
+
+		if ev.Key() == tcell.KeyCtrlS {
+			e.SaveFile()
+			return
+		}
 		switch ev.Key() {
 
+		case tcell.KeyEnter:
+			action := &editor.InsertAction{Pos: e.buffer.Cursor(), Rune: '\n'}
+			e.Do(action)
+
+		case tcell.KeyBackspace, tcell.KeyBackspace2:
+			if e.buffer.Cursor() > 0 {
+				deletedRune := []rune(e.buffer.String())[e.buffer.Cursor()-1]
+				action := &editor.DeleteAction{Pos: e.buffer.Cursor(), Rune: deletedRune}
+				e.Do(action)
+			}
 		case tcell.KeyCtrlC, tcell.KeyEscape:
 			e.running = false
-
+		case tcell.KeyRune:
+			action := &editor.InsertAction{Pos: e.buffer.Cursor(), Rune: ev.Rune()}
+			e.Do(action)
 		case tcell.KeyLeft:
 			e.buffer.MoveCursor(-1)
 		case tcell.KeyRight:
@@ -80,15 +194,6 @@ func (e *Editor) handleEvent(event tcell.Event) {
 			e.moveCursorLine(-1)
 		case tcell.KeyDown:
 			e.moveCursorLine(1)
-
-		case tcell.KeyEnter:
-			e.buffer.Insert('\n')
-		case tcell.KeyBackspace2, tcell.KeyBackspace:
-			e.buffer.Delete()
-
-		case tcell.KeyRune:
-			e.buffer.Insert(ev.Rune())
-
 		case tcell.KeyEnd:
 			e.handleEnd()
 		case tcell.KeyHome:
@@ -102,7 +207,6 @@ func (e *Editor) handleEvent(event tcell.Event) {
 func (e *Editor) handleEnd() {
 	lineMap := e.buildLineMap()
 	currentLine := e.getCurrentLine(lineMap)
-
 	e.buffer.MoveCursor(lineMap[currentLine][1] - e.buffer.Cursor())
 }
 
@@ -188,6 +292,8 @@ func (e Editor) moveCursorLine(offset int) {
 func (e *Editor) Draw() {
 	e.screen.Clear()
 
+	textAreaHeight := e.height - 1
+
 	content := e.buffer.String()
 
 	x, y := 0, 0
@@ -199,7 +305,7 @@ func (e *Editor) Draw() {
 			continue
 		}
 
-		if y < e.height && x < e.width {
+		if y < textAreaHeight && x < e.width {
 			e.screen.SetContent(x, y, r, nil, tcell.StyleDefault)
 		}
 
@@ -208,8 +314,109 @@ func (e *Editor) Draw() {
 
 	e.updateCursorPos()
 	e.screen.ShowCursor(e.cursorX, e.cursorY)
-
+	e.drawStatusBar()
 	e.screen.Show()
+}
+
+func (e *Editor) drawStatusBar() {
+	statusStyle := tcell.StyleDefault.Background(tcell.ColorGray).Foreground(tcell.ColorBlack)
+
+	filename := e.filename
+	if filename == "" {
+		filename = "[No Name]"
+	}
+
+	dirtyMarker := ""
+	if e.dirty {
+		dirtyMarker = "*"
+	}
+
+	leftStatus := fmt.Sprintf(" %s%s  ", filename, dirtyMarker)
+	rightStatus := fmt.Sprintf(" %d:%d ", e.cursorY+1, e.cursorX+1)
+
+	for i := 0; i < e.width; i++ {
+		e.screen.SetContent(i, e.height-1, ' ', nil, statusStyle)
+	}
+
+	col := 0
+	for _, r := range leftStatus {
+		e.screen.SetContent(col, e.height-1, r, nil, statusStyle)
+		col++
+	}
+
+	col = e.width - len(rightStatus)
+
+	for _, r := range rightStatus {
+		e.screen.SetContent(col, e.height-1, r, nil, statusStyle)
+		col++
+	}
+
+	if e.status != "" {
+		statusCol := (e.width - len(e.status)) / 2
+		for i, r := range e.status {
+			e.screen.SetContent(statusCol+i, e.height-1, r, nil, statusStyle)
+		}
+	}
+
+}
+
+func (e *Editor) drawSavePopup() {
+	saving := true
+	popupStyle := tcell.StyleDefault.Background(tcell.ColorWhite).Foreground(tcell.ColorBlack)
+	savingBuffer := buffer.New(1024)
+	for saving {
+		cwd, err := os.Getwd()
+
+		if err != nil {
+			return
+		}
+		saveMsg := "Saving file to directory: "
+		startCol := (e.width / 2) - len(saveMsg)
+
+		for _, r := range saveMsg {
+			e.screen.SetContent(startCol, e.height/2, r, nil, popupStyle)
+			startCol++
+		}
+
+		for i, r := range cwd {
+			e.screen.SetContent(startCol+i, e.height/2, r, nil, popupStyle)
+		}
+		e.screen.SetContent(startCol, e.height/2, '\n', nil, popupStyle)
+
+		fileNameMessage := "Enter file name: "
+		startCol = (e.width / 2) - len(saveMsg)
+		cursorPos := 0
+		for _, r := range fileNameMessage {
+			e.screen.SetContent(startCol, (e.height/2 + 1), r, nil, popupStyle)
+			startCol++
+		}
+		e.screen.Show()
+		event := e.screen.PollEvent()
+		switch ev := event.(type) {
+		case *tcell.EventKey:
+			if ev.Key() == tcell.KeyEsc {
+				saving = false
+			}
+			switch ev.Key() {
+			case tcell.KeyRune:
+				savingBuffer.Insert(ev.Rune())
+			case tcell.KeyBackspace, tcell.KeyBackspace2:
+				savingBuffer.Delete()
+			case tcell.KeyLeft:
+				savingBuffer.MoveCursor(-1)
+			case tcell.KeyRight:
+				savingBuffer.MoveCursor(1)
+			}
+		}
+
+		for _, r := range savingBuffer.String() {
+			e.screen.SetContent(startCol, e.height/2+1, r, nil, popupStyle)
+			startCol++
+		}
+		cursorPos = startCol
+		e.screen.ShowCursor(cursorPos+savingBuffer.Cursor(), e.height/2+1)
+		e.screen.Show()
+	}
 }
 
 func (e *Editor) updateCursorPos() {
